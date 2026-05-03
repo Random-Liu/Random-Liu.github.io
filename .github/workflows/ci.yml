@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
+      - uses: actions/cache@v4
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache
+          restore-keys: |
+            mkdocs-material-
+      - run: pip install mkdocs-material
+      - name: Prepare docs directory
+        run: |
+          mkdir docs
+          [ -d parts ] && cp -r parts docs/ || true
+          [ -d javascripts ] && cp -r javascripts docs/ || true
+          [ -d images ] && cp -r images docs/ || true
+          [ -f README.md ] && cp README.md docs/index.md || true
+          [ -f README.cn.md ] && cp README.cn.md docs/index.cn.md || true
+      - run: mkdocs gh-deploy --force
