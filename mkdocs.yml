@@ -11,6 +11,7 @@ theme:
     - navigation.expand
     - toc.follow
     - content.code.copy
+    - navigation.tags
   palette:
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
@@ -54,9 +55,21 @@ extra_javascript:
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
-  - "Home": index.md
-  - "中文": index.cn.md
-  - "LLM Book": https://random-liu.github.io/llm-inference-principle-to-production/
+  - "中文版":
+    - "首页": README.cn.md
+    - "体系化专题":
+      - "LLM 从原理到生产级推理": https://random-liu.github.io/llm-inference-principle-to-production/
+    - "技术笔记":
+      - "示例笔记": notes/example_note.cn.md
+      - "敬请期待": notes/coming_soon.cn.md
+  - "English":
+    - "Home": README.md
+    - "Structured Projects":
+      - "LLM Inference": https://random-liu.github.io/llm-inference-principle-to-production/
+    - "Tech Notes":
+      - "Example Note": notes/example_note.md
+      - "Coming Soon": notes/coming_soon.md
+
 
 extra:
   social:
