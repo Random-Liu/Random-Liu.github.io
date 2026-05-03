@@ -56,14 +56,14 @@ extra_javascript:
 
 nav:
   - "中文版":
-    - "首页": index.cn.md
+    - index.cn.md
     - "体系化专题":
       - "LLM 从原理到生产级推理": https://random-liu.github.io/llm-inference-principle-to-production/
     - "技术笔记":
       - "示例笔记": notes/example_note.cn.md
       - "敬请期待": notes/coming_soon.cn.md
   - "English":
-    - "Home": index.md
+    - index.md
     - "Structured Projects":
       - "LLM Inference": https://random-liu.github.io/llm-inference-principle-to-production/
     - "Tech Notes":
