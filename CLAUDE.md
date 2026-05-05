@@ -24,6 +24,8 @@ For long-form notes built from external discussions (e.g., a Gemini conversation
     - Clear, scoped edit requests (wording, formatting, GitHub suggestion blocks): apply directly with a new commit and reply on the thread.
     - Ambiguous comments, structural changes, or scope changes: ask in this chat session before editing.
     - Net-new technical sub-discussions happen in this chat session, not in PR threads.
-4. **Publish**: On PR approval (review approval or explicit "merge"), fast-forward merge to `main` and push. CI runs `mkdocs gh-deploy` automatically. Then call `unsubscribe_pr_activity`.
+4. **Publish**: GitHub does not allow self-approval, so do not wait for a formal approval state. Two paths trigger publish:
+    - User merges the PR directly in GitHub: just call `unsubscribe_pr_activity`. No further action.
+    - User leaves a `lgtm` / `approve` / `merge` comment on the PR: fast-forward merge `main` to the PR head, push, then call `unsubscribe_pr_activity`. CI runs `mkdocs gh-deploy` automatically.
 
 Mobile review preference: when feasible, prefer GitHub app's line comments and suggestion blocks on the PR over describing changes in chat — they map directly onto edits.
