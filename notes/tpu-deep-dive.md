@@ -940,3 +940,459 @@ Core philosophy: **compute everything and discard is cheaper than if-else**. For
 
 ---
 
+## Part IV — Cluster-Layer Adaptation (Goal D)
+
+### 15. K8s Abstractions for TPU
+
+**One sentence**: K8s can't see light, so OCS slicing must be handled by an independent component; the full chain is TPU device plugin + topology labels + Kueue + TPU Provisioner.
+
+#### 15.1 Resource Exposure: From Chip to Node
+
+Physically, TPU chips are not directly Nodes. Each chip (or 4/8-chip board) hangs off a Host VM running Kubelet.
+
+- **TPU Device Plugin**: Loaded by Kubelet, advertises an extended resource `google.com/tpu: 4` to the API Server.
+- **Topology labels**: Knowing the count of TPUs is not enough. The TPU Controller stamps detailed labels:
+
+```yaml
+cloud.google.com/gke-tpu-topology: 2x2x4        # this Node belongs to a 16-chip slice
+cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
+```
+
+In etcd, these labeled Nodes form logical resource pools.
+
+#### 15.2 User Interface: Slice CRD
+
+You don't write a plain Deployment — you submit a wrapped Job or a dedicated `TPUSlice` CRD:
+
+```yaml
+nodeSelector:
+  cloud.google.com/gke-tpu-topology: 4x4x4
+resources:
+  requests:
+    google.com/tpu: 64
+```
+
+Meaning: "I need 64 TPUs, physically wired into a 4×4×4 closed Torus."
+
+#### 15.3 Gang Scheduling: Kueue + TPU Provisioner
+
+Native `kube-scheduler` cannot do "all-or-nothing across 64 specific-topology nodes". This is **Gang Scheduling** territory; you need a batch scheduler like Kueue.
+
+End-to-end chain to bring up a 64-chip slice:
+
+| Step | Who | What |
+|---|---|---|
+| 1 | Kueue | Intercepts the Job, sees 4×4×4 needed. Resource pool can't satisfy → Pending |
+| 2 | Kueue / Cluster Autoscaler | When ready to schedule, triggers TPU Provisioner |
+| 3 | **TPU Provisioner** | **Bypasses K8s control plane**, calls the data center's OCS hardware API: "rotate mirrors, give me a 4×4×4 Torus" |
+| 4 | OCS | In seconds, mirror angles are set, optical paths locked |
+| 5 | Kubelet | Detects ICI link is up, updates Node labels |
+| 6 | Kueue | Confirms hardware ready, binds 64 Pods to 64 Nodes in one shot |
+
+**Key**: TPU Provisioner is an independent component outside K8s, connected to the data center's physical layer. This is the necessary compromise of "K8s can't see light."
+
+#### 15.4 Failure Self-Healing: OCS Routes Around Bad Chips
+
+Across months of pre-training or high-availability inference, TPU hardware failures (HBM degradation, blown optical modules) inevitably happen.
+
+| Step | Action |
+|---|---|
+| 1 | Kubelet health checks detect hardware error, report Node failure to API Server |
+| 2 | K8s tears down all 64 Pods of the Job |
+| 3 | TPU Controller marks the bad chip as Unhealthy, removes it from the available pool |
+| 4 | Controller calls OCS again: "route around that bad chip, pull a new chip from the pool, reconfigure mirrors, restitch a 4×4×4 ring" |
+| 5 | Optical paths restitch; Job restarts, loads previous checkpoint |
+
+The whole hardware-failure-to-rescheduled cycle typically closes in **a few minutes**, fully automated.
+
+#### 15.5 ↔ GPU
+
+| Dimension | TPU on GKE | GPU on K8s |
+|---|---|---|
+| Device Plugin | TPU Device Plugin | NVIDIA Device Plugin |
+| Topology awareness | Labels + TPU Provisioner calling OCS | NVIDIA Topology Aware Scheduling, `gpu-feature-discovery` |
+| Gang Scheduling | Kueue | Volcano, Kueue, KubeFlow |
+| Physical topology reconfig | OCS dynamic Torus assembly | (no equivalent; NVLink is fixed, IB fat-tree doesn't need reconfig) |
+
+**Trade-off**: TPU's hard topology constraint makes K8s abstractions more complex (you have to add a Provisioner) but yields dynamic slicing. GPU is simpler because there's no light to manage.
+
+---
+
+### 16. Multi-Host Slice Orchestration
+
+**One sentence**: When a slice spans multiple hosts, K8s sees N Pods coordinating their startup, while each Pod's TPUs are a 4 / 8-chip local group — N:N at two layers.
+
+#### 16.1 LWS and JobSet
+
+To express this multi-host compute, Kubernetes provides two APIs:
+
+- **LeaderWorkerSet (LWS)**: One Leader Pod + several Worker Pods, all sharing the same lifecycle. The Leader typically exposes the inference API.
+- **JobSet**: More general Job-group coordination.
+
+A 64-chip v4-64 slice corresponds to:
+
+```
+LWS:
+  size: 16             # 16 Host VMs
+  leader:
+    replicas: 1
+    containers:        # vLLM API + scheduler
+  worker:
+    replicas: 15
+    containers:        # same Python code (SPMD)
+```
+
+#### 16.2 SPMD Startup Mode
+
+The 16 Pods all run **the same Python code** (SPMD = Single Program Multiple Data). The code reads environment variables (`LWS_LEADER_ADDRESS`, `LWS_WORKER_INDEX`) to determine identity, then:
+
+- Leader: starts an HTTP/gRPC service for users.
+- All Pods: via PyTorch/XLA or JAX, init the distributed group, ICI comm self-establishes.
+- All Pods' CPUs simultaneously dispatch compute to the 4 TPUs underneath them.
+- The 64 TPUs run All-Reduce and similar collectives via ICI.
+- Leader collects results, returns to user.
+
+#### 16.3 Scheduling Coupling: Where a Single Failure Drags the Whole Slice
+
+| Failure layer | Outcome |
+|---|---|
+| Single TPU physical failure | Whole ICI ring breaks → 64 Pods' collectives hang → Job fails → 15.4 self-heal flow |
+| Single Host VM NIC or Kubelet failure | The Pod's 4 TPUs lose connectivity → same as above |
+| DCN (CPU-side ethernet) jitter | Leader↔Worker control-plane sync delay → service tail latency, but data plane (ICI) is unaffected |
+| Single VM CPU overload | That Pod feeds data slowly → drags the whole step (slowest VM determines throughput) |
+
+The blast radius is essentially **slice-level** — any host failure prevents 64 TPUs from continuing. So LWS / JobSet uses gang scheduling: all alive or all dead.
+
+#### 16.4 ↔ GPU
+
+| Dimension | TPU multi-host | GPU multi-host |
+|---|---|---|
+| Orchestration API | LWS / JobSet | MPI Operator, Training Operator, Ray on K8s |
+| Startup mode | SPMD | MPI / NCCL group |
+| Blast radius | Slice level (optical ring must be complete) | Usually Job level (fat-tree tolerates single-NIC failure) |
+| Leader role | Usually API gateway | MPI rank 0, or PS-Worker's PS |
+
+**Trade-off**: TPU's SPMD + LWS model is clean, but with a large blast radius; GPU's MPI model is flexible but configuration-heavy.
+
+---
+
+## Part V — System Comparison and Trade-offs (Goal B Concentration)
+
+### 17. Programming Model Chains: From Single Card to Multi-Machine
+
+**One sentence**: GPU is "single-card CUDA → multi-card NCCL → multi-machine IB/RDMA" — three segments; TPU is "SPMD → ICI (VLIW slot 5)" — one segment, run by the compiler.
+
+#### 17.1 GPU's Three Segments
+
+**Single card (Tensor Core)**
+
+```
+Python (PyTorch) → ATen → cuBLAS / Triton → SASS / PTX
+                                               ├ LDG.E (HBM → register)
+                                               ├ STS / LDS (Shared Memory hop)
+                                               └ HMMA.1688.F16 (Tensor Core triggers 16×8×16 half-precision MAC)
+```
+
+Data path: **HBM → register → Shared Memory → register → Tensor Core**, ping-ponging.
+
+**Within node, multi-card (NVLink + Copy Engine)**
+
+```
+NCCL → CUDA Kernel + Copy Engine
+DMA: GPU0_HBM → NVLink bus → GPU1_HBM
+Reduction: GPU1's SM does LDG / FADD / STG (data lands in HBM before being added)
+```
+
+NVLink provides Unified Virtual Addressing (UVA), but **the data must first land in the receiving GPU's HBM**, then the receiver's SM reads from HBM, adds locally, writes back to HBM. Eats a lot of HBM bandwidth.
+
+**Cross-machine (IB + GPUDirect RDMA)**
+
+```
+MMIO writes NIC Doorbell → NIC DMAs from GPU HBM → IB packets encapsulate → through Spine-Leaf switches → peer NIC decapsulates → DMA into peer GPU HBM
+Sync: Receiver GPU CUDA Kernel spin-waits on an HBM sync flag (LDG.CG bypasses cache)
+```
+
+Control plane has CPU interrupts, protocol encapsulation, route lookup; data plane has switch congestion control and queueing. **Async event-driven.**
+
+#### 17.2 TPU's Single Segment
+
+```
+JAX / PyTorch (via PyTorch/XLA) → HLO → XLA → VLIW 5-slot instruction stream
+                                                ├ DMA (HBM → UB)
+                                                ├ MXU (systolic array MAC)
+                                                ├ VPU (vector ops)
+                                                ├ ICI (cross-chip communication, peer to DMA)
+                                                └ SPU (control flow)
+
+Cross-chip communication:
+  TX_UB_TO_NEIGHBOR (Src: UB_local, Dest_Node: Neighbor_ID)
+  WAIT_ICI_RX_SEMAPHORE
+  ADD_VECTOR (Src1: UB_local, Src2: UB_remote, Dest: UB_result)
+```
+
+Cross-chip data transfer and intra-chip moves are **logically equivalent** — both are switches in the VLIW word. XLA can have the MXU multiplying while ICI transmits the previous layer's gradient — cycle-level overlap.
+
+#### 17.3 The Comparison
+
+| Dimension | GPU | TPU |
+|---|---|---|
+| Cross-node comm essence | Async IO (CPU interrupts, protocols, switches) | Synchronous instruction (one VLIW slot) |
+| Receiver-side handling | spin-wait HBM flag | Hardware semaphore, instant wake |
+| Data landing | HBM (mandatory toll) | UB (direct to VPU) |
+| Compiler view | Can't see cross-node | Knows every hop and latency |
+| Failure tolerance | Node-level isolation | Slice-level coupling |
+
+#### 17.4 Three Analogies
+
+- **Single-machine GPU compute**: A massively busy interchange (huge cache + scheduler). Congested, but precise traffic lights (Warp Scheduler) keep throughput high.
+- **Cross-machine GPU RDMA**: Cross-province highway logistics. Pack and seal → onto highway → off highway. Toll fees (protocol overhead) + unpredictable jams (congestion).
+- **TPU Pod (VLIW + ICI + 3D Torus)**: A massive fully-automated production line. Every conveyor (fiber) and arm (MXU/VPU) is hard-wired. XLA is the master schedule, ensuring every part arrives at the right station on a precise cycle.
+
+---
+
+### 18. Cost / Efficiency
+
+**One sentence**: MFU and Tokens/$ are the levers that measure real ledger differences — not chip peak FLOPs.
+
+#### 18.1 Compute Unit Cost: NVIDIA Tax
+
+| Dimension | NVIDIA H100 | Google TPU v5p |
+|---|---|---|
+| Equivalent compute hardware cost (industry estimate) | **~$21,000+** | **~$6,900** |
+| Roughly ~3× spread | Known as **NVIDIA Tax** | |
+
+Cloud on-demand prices:
+
+| Form | Price |
+|---|---|
+| 8×H100 VM (Azure / GCP) | **$100 - $120 / hour** (per chip ~$12-$15) |
+| TPU v5e (inference) | **~$1.20 / hour** (single chip) |
+| 8-chip v5e node | **$10 - $11 / hour** |
+
+#### 18.2 MFU (Model FLOPs Utilization)
+
+Actual TFLOPs ÷ hardware peak:
+
+| Chip | Typical LLM training MFU |
+|---|---|
+| H100 | 50% - 52% (thread scheduling, cache contention, complex control flow overhead) |
+| TPU v5p | 58% - 60% or higher (XLA static orchestration + ICI deterministic latency) |
+
+#### 18.3 Performance / Watt
+
+- **H100 TDP 700W**: must power L1/L2 cache and out-of-order scheduler.
+- **TPU drops those modules**, relying on a minimal MXU systolic array. Statistics show that on certain large matrix workloads, TPU v5e/v5p energy is **60-65% lower** than GPU clusters (in some scenarios efficiency is 2-5× H100).
+
+Saves on power + lowers data center cooling/infrastructure costs.
+
+#### 18.4 Real-World Tokens / Dollar
+
+| Case | Improvement |
+|---|---|
+| **Large model pre-training** (H100 → TPU v5p) | Tokens / $ higher by **15% - 25%** |
+| **Midjourney** (image gen, migrated to TPU v6e) | Inference bill from **$2.1M / month** down to **<$0.7M / month**, a **3×** cost reduction with throughput maintained |
+| **Character.AI** (high-concurrency dialog) | After migration to TPU, cost improvement of **3.8×** |
+| **Waymark** (video diffusion) | Cost **4×** lower than H100 |
+
+#### 18.5 One-Sentence Industry Picture
+
+- For research teams that iterate fast, modify operators frequently, and depend on the deep PyTorch/CUDA ecosystem → GPU.
+- For super-scale, structurally stable pre-training, or hundred-million-user high-concurrency LLM inference → TPU clusters.
+
+> **[Note — added by Claude]** The above cases (Midjourney $2.1M→$700K, Character.AI 3.8×, Waymark 4×) lack precise sources and dates in the original conversation; only "public reports show". I have no other reliable confirmation of the specific numbers — please verify.
+
+---
+
+### 19. TPU's Hardware Disadvantages and Trade-offs
+
+**One sentence**: Each advantage of static scheduling has a workload it can't handle well — large MXU granularity, weak SPU, 3D Torus All-to-All congestion, and HBM bandwidth/compute mismatch.
+
+#### 19.1 Compute Granularity: The Fragmentation Penalty of MXU 128×128
+
+GPU Tensor Core is 16×8×16; TPU MXU is 128×128. On a real inference need that can't align to multiples of 128 (e.g., batch size 5):
+
+- GPU: Warp Scheduler tightly packs the fragments into SMs, hardware utilization stays decent.
+- TPU: A lot of physical ALUs in the MXU **literally compute 0×W=0**, wasting cycles.
+
+For high-frequency, low-concurrency, low-latency inference requests, TPU's physical compute is severely wasted.
+
+#### 19.2 Weak Scalar / Branch Control: The Pain of Sampling and Speculative Decoding
+
+LLMs aren't all matmul — the final step in token generation is **sampling** (Top-K, Top-P, temperature, penalty factors), involving lots of sorting, conditional branches, and scalar ops.
+
+- GPU: Massive CUDA Cores + SIMT branch prediction; can dispatch tens of thousands of threads concurrently to handle array ops with logic.
+- TPU: SPU compute is extremely weak; VPU only excels at regular vectors. Facing if-else heavy sampling, efficiency tanks.
+
+Even worse is **vanilla speculative decoding** — hardware needs to rapidly determine which tokens are accepted and dynamically discard parts of the compute graph. This "step then reassess" dynamic graph is the antithesis of TPU VLIW static instructions. Hence Gemini's Tree Attention tensorization (Section 14.2) forces this kind of computation into matmul.
+
+#### 19.3 Dynamic Network Routing: MoE All-to-All Congestion
+
+MoE's core is **dynamic routing** — each token at runtime is sent to a different expert:
+
+| Cluster | All-to-All behavior |
+|---|---|
+| GPU (NVSwitch + IB fat-tree) | Any N:N comm gets non-blocking full-cross bandwidth — friendly to MoE's chaotic, dynamic packet dispatch |
+| TPU (3D Torus ring) | Static All-Reduce is unmatched; but in All-to-All, tokens must traverse multiple intermediaries across X/Y/Z axes to find their expert. **Some links get jammed, others idle**, dragging end-to-end latency |
+
+#### 19.4 Big Decode Batches Don't Save MoE: Two Dead-Ends
+
+Intuition: large batch raises MoE comm density, so compute could mask comm. Two physical dead-ends:
+
+**Dead-end 1: Tokens disperse, matrices stay small**
+
+512 concurrent requests → MoE layer → routed to 8 experts → average 64 tokens per expert. `[64, D] × [D, 4D]` is "between the teeth" for the MXU — far short of saturating compute to mask comm latency.
+
+**Dead-end 2: KV Cache breaks HBM**
+
+You can't grow batch unboundedly. To saturate MoE compute (thousands), HBM is long since OOM.
+
+**Conclusion**: In Decode, MoE comm overhead can only be mitigated, not fully masked.
+
+#### 19.5 Multi-Hop Affects Latency or Bandwidth
+
+Across racks on a 3D Torus to find experts:
+
+- **Small batch**: Dominated by **latency**. Optical relay + transceiver physical delay can't be skipped.
+- **Big batch**: The killer is **bisection bandwidth**. With tokens scattering everywhere, some fibers get instantly overloaded; effective bandwidth collapses.
+
+#### 19.6 The Math Behind Compute-Masks-Comm
+
+Why does Prefill mask comm but Decode can't? Look at the dimensions:
+
+| Phase | Compute | Data transfer | Ratio |
+|---|---|---|---|
+| **Prefill** (GEMM) | $O(N^3)$ | $O(N^2)$ | Compute time ≫ network time, DMA stages in the background, MXU completely unaware |
+| **Decode** (GEMV) | $O(N^2)$ | $O(N^2)$ | Roughly equal, MXU finishes computing instantly then has to stop and wait |
+
+#### 19.7 HBM Bandwidth vs Compute Imbalance (Echoing 6.4)
+
+Chapter 6's physical law: compute scales $O(N^2)$, traditional bandwidth scales $O(N)$. The v4 era was severely imbalanced; Decode MFU dropped to single digits.
+
+Google's hardware-side mitigation: **the v5e shrinks the MXU on purpose**, lowering peak FLOPs to bring the compute/bandwidth ratio into a healthy zone.
+
+Algorithmic mitigation: **MQA / GQA** (Multi-Query / Grouped-Query Attention) — drastically shrinks KV Cache, reducing each Decode step's HBM pull. This is a model-architecture concession purely to placate poor memory bandwidth.
+
+#### 19.8 What Each Weakness Buys
+
+| Weakness | Buys |
+|---|---|
+| MXU large granularity | Higher compute density per silicon area, better energy efficiency |
+| Weak SPU | Saved transistors fed back into the MXU |
+| 3D Torus weak at All-to-All | Excellent regular collective comm, no external switch overhead |
+| HBM bandwidth lags | Compute density off-the-charts; high MFU on Prefill / training |
+
+Each weakness corresponds to a trade-off. Understanding these is what lets you decide which workloads belong on TPU and which belong on GPU.
+
+---
+
+## Appendix
+
+### A. Trade-off Cheat Sheet
+
+Cross-cut by design dimension; each trade-off links back to its chapter.
+
+| Dimension | TPU choice | Cost | Benefit | Chapters |
+|---|---|---|---|---|
+| **Static vs dynamic scheduling** | Static VLIW + XLA | High compile cost, shape changes recompile | Minimal hardware, high efficiency | Ch 1, 7, 8 |
+| **Cache vs direct passthrough** | No hardware cache, only UB + DMA | Software complexity | Save silicon area for the MXU | Ch 1, 6 |
+| **Granularity large vs small** | MXU 128×128 | Wastes on small matrices | High density on large matrices | Ch 1, 19 |
+| **Ring vs tree** | 3D Torus | All-to-All congestion, long-edge ring latency | Excellent All-Reduce, no external switch | Ch 2, 4, 19 |
+| **Physical vs optical** | OCS reconfigurable | Slicing limited by rack granularity | Dynamic topology + failure self-heal | Ch 3, 15 |
+| **Centralized vs distributed orchestration** | Multi-host SPMD | Blast radius = slice | Clean orchestration, transparent SPMD | Ch 5, 16 |
+| **Compute vs bandwidth** | Compute scales by area, bandwidth via packaging | Memory wall, low Decode MFU | High Prefill / training MFU | Ch 6, 19 |
+| **Specialized vs general** | Pallas for PagedAttention | High engineering bar; every dynamic op needs a hand-write | Breaks XLA's static limit | Ch 11, 14 |
+| **Padding vs recompile** | Keep batch buckets, fill with dummies | Wastes a small fraction of compute | Avoid recompile disaster | Ch 8, 12 |
+| **Algorithm yields to hardware** | Capacity Factor, Tree Attention | Token dropping, increased mask complexity | TPU can run MoE and speculative decoding | Ch 14 |
+
+### B. Numbers / Parameters List
+
+All numbers labeled "from source conversation".
+
+| Item | Value | Note |
+|---|---|---|
+| TPU v4 Pod scale | **4096 chips** | 64 racks × 64 chips |
+| TPU v5p Pod scale | **8960 chips** | Full scale |
+| Single-rack chip count | **64** (v4 water-cooled) | 4 chips/board × 16 boards |
+| MXU size | **128 × 128** MAC cells | v4 / v5p |
+| 4×4×4 rack outgoing fibers | **96** | 8 corners×3 + 24 edges×2 + 24 face-centers×1 |
+| Surface TPUs | **56** | 64 - inner 8 |
+| Equivalent H100 hardware cost | **~$21,000** | NVIDIA selling price |
+| Equivalent TPU v5p hardware cost | **~$6,900** | Google internal |
+| 8×H100 VM on-demand | **$100-120 / hour** | Azure / GCP |
+| 8×TPU v5e node on-demand | **$10-11 / hour** | Google Cloud |
+| H100 TDP | **700W** | |
+| H100 training MFU | **50% - 52%** | Large LLM clusters |
+| TPU v5p training MFU | **58% - 60%** or higher | Equivalent task |
+| TPU energy advantage | **60-65% lower** than GPU clusters | Specific large matrix workloads |
+| Tokens / $ advantage (pre-training) | TPU higher by **15% - 25%** | H100 → v5p |
+| Midjourney inference bill | **$2.1M → <$0.7M / month** | Migrated to TPU v6e, 3× |
+| Character.AI cost improvement | **3.8×** | After TPU migration |
+| Waymark video gen | **4×** | Lower than H100 |
+| CPU:TPU ratio | **1:4 or 1:8** | Hard-wired physically |
+| ICI single-link bandwidth order | (not in source) | Public ~4.5 TB/s aggregated multi-direction on v4, please verify |
+| H100 L2 Cache | **50 MB** | Mentioned in source |
+| MoE Capacity Factor example | 64 tokens per expert | Source example |
+| v5p possible long-edge | **35** | 16×16×35 ≈ 8960 estimate |
+| Cross-rack Z-axis 8-hop ring | **6 copper hops + 2 optical hops** | 4×4×8 slice |
+| Optical vs copper latency | Optical **hundreds of ns**, copper **single to low-double-digit ns** | NUCA heterogeneity |
+
+### C. Terminology ↔ GPU Equivalent Mapping
+
+| TPU term | GPU equivalent | Note |
+|---|---|---|
+| **MXU** | Tensor Core | TPU one big array vs GPU many small arrays |
+| **VPU** | CUDA Core (partial) | TPU biased toward regular vectors |
+| **SPU** | Scalar dispatch + registers | TPU control flow is weak |
+| **Unified Buffer (UB)** | Shared Memory + L1/L2 | TPU software-managed; GPU hardware-managed |
+| **HBM** | HBM | Same |
+| **ICI** | NVLink + IB (combined) | TPU one fabric inside and outside; GPU two layers |
+| **OCS** | (no equivalent) | Unique |
+| **3D Torus** | Fat-Tree (different idea) | Different topology philosophy |
+| **SPMD** | NCCL collective + MPI rank | TPU compiler-managed |
+| **VLIW 5-slot** | (no full equivalent) | GPU is SIMT |
+| **XLA** | TorchInductor / TVM / TensorRT | TPU's core; GPU's optional |
+| **HLO / StableHLO** | FX Graph / TorchScript | XLA's IR |
+| **Pallas** | Triton | Custom kernel language |
+| **JetStream** | TensorRT-LLM | Vendor-specialized inference engine |
+| **Saxml** | DeepSpeed Inference (partial) | JAX legacy |
+| **TPU Provisioner** | (no equivalent) | Closest is Slurm topology + manual NCCL |
+| **TPU Device Plugin** | NVIDIA Device Plugin | Same K8s concept |
+| **LWS / JobSet** | MPI Operator / Training Operator | Multi-host orchestration |
+| **DCN (datacenter network)** | Control-plane IB / Ethernet | TPU uses ethernet; GPU often uses IB |
+| **Capacity Factor** (MoE) | (no TPU-specific equivalent; concept exists on GPU but isn't enforced) | Static-ization trick |
+| **Tree Attention** (speculative decoding) | Same name | At the algorithm level; now used on GPU too |
+| **Bucketing + AOT** | torch.compile + persistent cache | Mandatory on TPU; optional on GPU |
+| **NUCA topology-aware mapping** | NCCL topology discovery | Auto in XLA on TPU; semi-manual on GPU |
+
+---
+
+## Writing Log (For Author Verification)
+
+### Intentional Cuts (Items in source not carried into the note)
+
+The following details were noticed but not carried forward — please decide whether to add them back.
+
+1. **vLLM `model.generate()` token-generation call stack** (around source lines 850-870): A detailed walk through PyTorch eager invoking ATen line-by-line under Lazy Tensor. I judged this to be a GPU-side eager-mode explanation, not the focus of TPU notes; simplified to a single "PyTorch Lazy Tensor" line in Ch 8.1's table.
+2. **Specific GPU single-card SASS instruction example** (around source lines 700-720): `LDG.E`, `STS [Shared_Addr_A]`, `HMMA.1688.F16` instruction names are used only once in Ch 17.1. If you'd like more detailed GPU instruction comparison, this can be expanded.
+3. **SPMD startup detail of Pod ID reading** (source line 604): "code internally reads the hardware Device_ID to decide which data block to load". I simplified to "reads environment variables to determine identity" in Ch 16.2, without distinguishing TPU device ID and K8s pod environment variables. Worth expanding?
+4. **TPU v6e (Trillium)**: Source line 1707 mentions this is the "sixth generation" pure-inference chip, but no specific specs. The Midjourney case mentions its name. I didn't open a section. If you want a v6e-specific design trade-off section, this can be expanded.
+5. **OCS internal MEMS array two-layer structure** (source lines 1521-1538): The first mirror aims direction, the second mirror corrects beam, preventing fiber-input angle deviation attenuation. I merged this into Ch 3.1 as "input → reflect → reflect → output", without emphasizing the necessity of two-layer MEMS. Refine?
+6. **OCS external physical wiring (MPO/MTP high-density optical cables)**: Source line 2278 describes how 96 fibers in the data center are bundled via MPO/MTP at 16/32 fibers each. I mentioned this once but didn't elaborate on physical form.
+7. **Capacity Factor cost detail**: Source lines 1628-1631 mention token dropping or "forced through a fallback general network". I only wrote dropping, didn't write the fallback network branch.
+8. **Sampling specifics** (Top-K / Top-P / temperature / penalty factors): Ch 19.2 mentions this is an SPU weakness but doesn't expand on each sampling algorithm's hardware cost.
+9. **Cerebras / Groq designs** (source lines 1500-1510): As a side note on "what other vendors are doing", mentions Wafer-Scale and LPU. I didn't include them in the main text since they aren't TPU-themed. Worth adding an Appendix D "industry cross-reference"?
+10. **"Native sparsity / clock-gated power off"** (source line 1810): As a next-gen chip evolution direction. I touched it briefly in Ch 14.4 without a dedicated subsection.
+
+### External Additions (Claude added, not in source)
+
+The following are explicitly tagged with `> **[Note — added by Claude]**` in the body:
+
+- Ch 2.1: ICI single-link 4.5 TB/s order (public source, not in original)
+- Ch 3.6: Microsoft Azure trialing Lumen OCS in some clusters (industry note, not in main text)
+- Ch 6.4: "Single-digit MFU in v4 era" lacks other sources to verify
+- Ch 13.5: Mooncake-style KV pool reference (not in main text)
+- End of Ch 18: Midjourney / Character.AI / Waymark specific numbers — source only says "public reports show", no year or attribution. Please verify.
+
+If there are missed cuts, raise them on the PR — I'll address them inline.
+
+
