@@ -937,3 +937,459 @@ GPU 路线图里也在朝 Tree Attention 等张量化方向走，但不是被硬
 | 投机解码 | Tree Attention 张量化 | if-else 也能跑（性能差点） |
 
 ---
+
+## Part IV — 集群层适配（目标 D）
+
+### 15. K8s 上的 TPU 抽象
+
+**一句话**：K8s 看不见光，所以 OCS 切分必须由独立组件负责，TPU device plugin + 拓扑标签 + Kueue + TPU Provisioner 组成完整链路。
+
+#### 15.1 资源暴露：从芯片到 Node
+
+物理上 TPU 芯片不直接是 Node。每颗 TPU（或 4/8 颗一组的主板）挂在一台 Host VM 上，VM 上跑 Kubelet。
+
+- **TPU Device Plugin**：Kubelet 加载，向 API Server 汇报扩展资源 `google.com/tpu: 4`
+- **拓扑标签**：仅知道有几颗 TPU 不够，TPU Controller 给 Node 打详细 label：
+
+```yaml
+cloud.google.com/gke-tpu-topology: 2x2x4        # 当前节点属于一个 16 芯切片
+cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
+```
+
+K8s etcd 里这些带 label 的 Node 组成逻辑资源池。
+
+#### 15.2 用户接口：Slice CRD
+
+不能写普通 Deployment，要用包装好的 Job 或专用 `TPUSlice` CRD：
+
+```yaml
+nodeSelector:
+  cloud.google.com/gke-tpu-topology: 4x4x4
+resources:
+  requests:
+    google.com/tpu: 64
+```
+
+意思：「我要 64 颗 TPU，物理连线必须是 4×4×4 闭环网络。」
+
+#### 15.3 Gang Scheduling：Kueue + TPU Provisioner
+
+原生 `kube-scheduler` 做不到「要么同时拿到 64 个特定拓扑节点，要么一个都不要」。这是**帮派调度（Gang Scheduling）**的活，必须靠 Kueue 这类批处理调度器。
+
+完整拉起一个 64 芯切片的链路：
+
+| Step | 谁干 | 干什么 |
+|---|---|---|
+| 1 | Kueue | 拦截 Job，发现要 4×4×4。资源池凑不齐 → Pending |
+| 2 | Kueue / Cluster Autoscaler | 决定调度时通过 TPU Provisioner 触发 |
+| 3 | **TPU Provisioner** | **绕过 K8s 控制面**，直接调底层数据中心的 OCS 硬件 API：「转镜子，给我拼 4×4×4 Torus」 |
+| 4 | OCS | 几秒内调好镜片角度，光路锁定 |
+| 5 | Kubelet | 探测到 ICI 链路接通，更新 Node Label |
+| 6 | Kueue | 确认硬件就绪，把 64 个 Pod 一次性绑定到 64 个 Node |
+
+**关键**：TPU Provisioner 是 K8s 之外、连到数据中心物理层的独立组件。这是「K8s 看不见光」必然要做的妥协。
+
+#### 15.4 故障自愈：OCS 绕过坏点
+
+长达几个月的预训练或高可用推理服务里，TPU 硬件（HBM 降级、光模块烧毁）故障必然发生。
+
+| 步骤 | 动作 |
+|---|---|
+| 1 | Kubelet 健康检查脚本发现硬件报错，向 API Server 报 Node 故障 |
+| 2 | K8s 终止整个 Job 的 64 个 Pod |
+| 3 | TPU Controller 标记坏芯片为 Unhealthy，从可用池剔除 |
+| 4 | Controller 再呼叫 OCS：「绕过那个坏点，从池子里拉一颗新芯片，重新调几面镜子，再缝合一个 4×4×4 环」 |
+| 5 | 光路缝合完毕，Job 重启，加载上一个 checkpoint |
+
+整个从硬件损坏到重新调度通常**几分钟内**全自动闭环。
+
+#### 15.5 ↔ GPU
+
+| 维度 | TPU on GKE | GPU on K8s |
+|---|---|---|
+| Device Plugin | TPU Device Plugin | NVIDIA Device Plugin |
+| 拓扑感知 | 标签 + TPU Provisioner 调 OCS | NVIDIA Topology Aware Scheduling、`gpu-feature-discovery` |
+| Gang Scheduling | Kueue | Volcano、Kueue、KubeFlow |
+| 物理拓扑重配 | OCS 动态拼接 Torus | (无对应；NVLink 是死的，IB fat-tree 不需要重配) |
+
+**Trade-off**：TPU 的拓扑硬约束让 K8s 抽象更复杂（必须拉个 Provisioner 出来），但换来动态切片能力。GPU 简单很多，因为没光要管。
+
+---
+
+### 16. Multi-host slice 的编排
+
+**一句话**：一个 slice 跨多 host 时，K8s 看到的是 N 个 Pod 的协同启动，每个 Pod 内的 TPU 又是 4 / 8 个芯片的本地组——这是两层 N:N。
+
+#### 16.1 LWS 与 JobSet
+
+Kubernetes 官方为了表达这种 multi-host 算力，提供两个 API：
+
+- **LeaderWorkerSet (LWS)**：一个 Leader Pod + 多个 Worker Pod，整组生命周期一致。Leader 通常对外暴露推理 API
+- **JobSet**：多组 Job 的协同管理，更通用
+
+64 芯 v4-64 切片对应：
+
+```
+LWS:
+  size: 16             # 16 台 Host VM
+  leader:
+    replicas: 1
+    containers:        # 跑 vLLM API + 调度器
+  worker:
+    replicas: 15
+    containers:        # 跑同一份 Python 代码（SPMD）
+```
+
+#### 16.2 SPMD 启动模式
+
+16 个 Pod 跑**同一份 Python 代码**（SPMD = Single Program Multiple Data）。代码内部读环境变量（`LWS_LEADER_ADDRESS`、`LWS_WORKER_INDEX`）确定身份，然后：
+
+- Leader：起 HTTP/gRPC 服务接客
+- 所有 Pod：通过 PyTorch/XLA 或 JAX 初始化分布式 group，自动建立 ICI 通信
+- 所有 Pod 上的 CPU 同时调度自己脚下 4 颗 TPU 做计算
+- 64 颗 TPU 通过 ICI 完成 All-Reduce 等集合通信
+- Leader 收集结果返回客户
+
+#### 16.3 调度耦合点：哪一层 fail 会拖整个 slice
+
+| 故障层 | 后果 |
+|---|---|
+| 单颗 TPU 物理坏 | 整个 ICI 环网断 → 64 个 Pod 集合通信挂起 → Job 失败 → 走 15.4 自愈流程 |
+| 单台 Host VM 网卡或 Kubelet 故障 | 该 Pod 上的 4 颗 TPU 失联 → 同上 |
+| DCN（CPU 间以太网）抖动 | Leader↔Worker 控制面同步延迟 → 推理服务延迟抖动，但数据面（ICI）不受影响 |
+| 单台 VM CPU 过载 | 该 Pod 喂数据慢 → 拖整个 step（最慢的那台决定整体速度） |
+
+故障半径基本上是 **slice 级别**——任何一个 host fail 都让 64 颗 TPU 无法继续。所以 LWS / JobSet 用 gang scheduling，要么全活要么全死。
+
+#### 16.4 ↔ GPU
+
+| 维度 | TPU multi-host | GPU multi-host |
+|---|---|---|
+| 编排 API | LWS / JobSet | MPI Operator、Training Operator、Ray on K8s |
+| 启动模式 | SPMD | MPI / NCCL group |
+| 故障半径 | Slice 级（光环必须完整） | 通常 job 级（fat-tree 容忍单 NIC 故障） |
+| Leader 角色 | 通常做 API gateway | MPI rank 0 或 PS-Worker 中的 PS |
+
+**Trade-off**：TPU 的 SPMD + LWS 模型简洁，但故障半径大；GPU 的 MPI 模型灵活但配置繁琐。
+
+---
+
+## Part V — 系统对比与权衡（目标 B 集中点）
+
+### 17. 编程模型链：从单卡到多机的指令链
+
+**一句话**：GPU 是「单卡 CUDA → 多卡 NCCL → 多机 IB/RDMA」三段；TPU 是「SPMD → ICI（VLIW 第五槽）」一段，编译器统管。
+
+#### 17.1 GPU 的三段式
+
+**单卡（Tensor Core）**
+
+```
+Python (PyTorch) → ATen → cuBLAS / Triton → SASS / PTX
+                                               ├ LDG.E (HBM → 寄存器)
+                                               ├ STS / LDS (Shared Memory 中转)
+                                               └ HMMA.1688.F16 (Tensor Core 触发 16×8×16 半精度乘加)
+```
+
+数据流：**HBM → 寄存器 → Shared Memory → 寄存器 → Tensor Core**，反复横跳。
+
+**节点内多卡（NVLink + Copy Engine）**
+
+```
+NCCL → CUDA Kernel + Copy Engine
+DMA: GPU0_HBM → NVLink 总线 → GPU1_HBM
+Reduction: GPU1 SM 做 LDG / FADD / STG（数据落地 HBM 后才加）
+```
+
+NVLink 提供统一虚拟寻址（UVA），但**数据必须先落地到接收方 HBM**，然后接收方 SM 从 HBM 读出来加，再写回 HBM。吃掉大量 HBM 带宽。
+
+**节点间多机（IB + GPUDirect RDMA）**
+
+```
+MMIO 写 NIC Doorbell → NIC DMA 读 GPU HBM → IB 包封装 → 经 Spine-Leaf 交换机 → 对端 NIC 解包 → DMA 写对端 HBM
+同步: 接收端 GPU CUDA Kernel 在 HBM 同步 flag 上 spin-wait（LDG.CG 绕过 cache）
+```
+
+控制面有 CPU 中断、协议封装、路由查询；数据面有交换机拥塞控制和排队。**异步事件驱动**。
+
+#### 17.2 TPU 的一段式
+
+```
+JAX / PyTorch (via PyTorch/XLA) → HLO → XLA → VLIW 五槽指令流
+                                                ├ DMA (HBM → UB)
+                                                ├ MXU (脉动阵列乘加)
+                                                ├ VPU (向量运算)
+                                                ├ ICI (跨芯片通信，跟 DMA 平级)
+                                                └ SPU (控制流)
+
+跨芯片通信:
+  TX_UB_TO_NEIGHBOR (Src: UB_local, Dest_Node: Neighbor_ID)
+  WAIT_ICI_RX_SEMAPHORE
+  ADD_VECTOR (Src1: UB_local, Src2: UB_remote, Dest: UB_result)
+```
+
+跨芯片传数据和片内搬砖**没有逻辑区别**，都是 VLIW 指令字上的一个开关。XLA 可以让 MXU 算乘法的同时 ICI 传上一层梯度，时钟周期级 overlap。
+
+#### 17.3 对比
+
+| 维度 | GPU | TPU |
+|---|---|---|
+| 跨节点通信本质 | 异步 IO（CPU 中断、协议、交换机） | 同步指令（VLIW 一槽） |
+| 接收端处理 | spin-wait HBM flag | 硬件信号量瞬间唤醒 |
+| 数据落地点 | HBM（必经收费站） | UB（直接送 VPU） |
+| 编译器视角 | 看不到跨节点 | 看到所有跳数和延迟 |
+| 故障容忍 | 节点级隔离 | Slice 级紧耦合 |
+
+#### 17.4 三种比喻
+
+- **单机 GPU 计算**：极度繁忙的立交桥路口（庞大缓存 + 调度器）。拥堵但靠精妙红绿灯（Warp Scheduler）保证吞吐
+- **跨机 GPU RDMA**：跨省高速公路物流。打包封装 → 上高速 → 下高速。路桥费（协议开销）+ 不可预知塞车（拥塞）
+- **TPU Pod (VLIW + ICI + 3D Torus)**：极其庞大的全自动流水线工厂。所有传送带（光纤）和机械臂（MXU/VPU）都是硬连线。XLA 是排班表，确保每个零件在精准的周期到达指定工位
+
+---
+
+### 18. 成本 / 能效
+
+**一句话**：MFU 和 Tokens/$ 这两个指标是衡量真实账面差异的杠杆，不是芯片峰值算力。
+
+#### 18.1 算力单价：NVIDIA Tax
+
+| 维度 | NVIDIA H100 | Google TPU v5p |
+|---|---|---|
+| 等效算力硬件成本（业界拆解估算） | **~$21,000** 以上 | **~$6,900** |
+| 中间 ~3× 差价 | 俗称 **NVIDIA Tax（英伟达税）** | |
+
+云端按需价：
+
+| 形态 | 单价 |
+|---|---|
+| 8 卡 H100 VM（Azure / GCP） | **$100 - $120 / 小时**（单芯 ~$12-$15） |
+| TPU v5e（推理专用） | **~$1.20 / 小时**（单芯） |
+| 8 芯 v5e 节点 | **$10 - $11 / 小时** |
+
+#### 18.2 MFU（Model FLOPs Utilization）
+
+实际跑出的 TFLOPs ÷ 硬件理论峰值：
+
+| 芯片 | LLM 训练典型 MFU |
+|---|---|
+| H100 | 50% - 52%（线程调度、缓存竞争、复杂控制流损耗） |
+| TPU v5p | 58% - 60% 甚至更高（XLA 静态编排 + ICI 确定性延迟） |
+
+#### 18.3 能效比（Performance / Watt）
+
+- **H100 TDP 700W**：要给 L1/L2 cache 和乱序调度器供电
+- **TPU 砍掉了这些模块**，全靠极简 MXU 脉动阵列。统计显示对特定大规模矩阵 workload，TPU v5e/v5p 能耗比 GPU 集群低 **60% 到 65%**（某些场景能效优势达 H100 的 2-5 倍）
+
+省电费 + 降低数据中心散热 / 基建成本。
+
+#### 18.4 真实业务的 Tokens / Dollar
+
+| 案例 | 改善 |
+|---|---|
+| **大模型预训练**（H100 → TPU v5p） | Tokens / $ 高 **15% - 25%** |
+| **Midjourney**（图像生成，迁到 TPU v6e） | 推理账单从 **$2.1M / 月** 骤降至 **<$0.7M / 月**，降本 **3 倍**，吞吐不变 |
+| **Character.AI**（高并发对话） | 转 TPU 后成本改善 **3.8 倍** |
+| **Waymark**（视频扩散模型） | 成本比 H100 低 **4 倍** |
+
+#### 18.5 一句话总结行业格局
+
+- 需要快速迭代、频繁改算子、依赖 PyTorch/CUDA 复杂生态的研究团队 → GPU
+- 超大规模、结构稳定的预训练 / 亿级用户高并发 LLM 推理 → TPU 集群
+
+> **[补充 — Claude 加]** 上述案例（Midjourney $2.1M→$700K、Character.AI 3.8×、Waymark 4×）的具体出处和年份在原对话里没给，仅说"公开报告显示"。我没有别的可信来源验证具体数字，请你核实。
+
+---
+
+### 19. TPU 的硬件劣势与权衡
+
+**一句话**：每个静态调度的优势都对应一个不擅长的工作负载——MXU 粒度大、SPU 弱、3D Torus All-to-All 拥塞、HBM 带宽 vs 算力失衡。
+
+#### 19.1 计算粒度：MXU 128×128 的"碎片化"惩罚
+
+GPU Tensor Core 16×8×16，TPU MXU 128×128。当 batch size 是 5 这种不能对齐 128 的真实需求：
+
+- GPU：Warp Scheduler 把碎片紧凑塞进 SM，硬件利用率依然不低
+- TPU：硅片上 MXU 大量物理 ALU **真的在算 0×W=0**，白白消耗 cycle
+
+在高频、小并发的低延迟推理请求下，TPU 的物理算力被严重浪费。
+
+#### 19.2 标量与分支控制羸弱：采样与投机解码的痛点
+
+LLM 不只有矩阵乘——生成 token 的最后一步是**采样**（Top-K、Top-P、温度、惩罚因子），涉及大量排序、条件分支、标量运算。
+
+- GPU：海量 CUDA Core + SIMT 分支预测，能并发万级线程做带逻辑判断的数组操作
+- TPU：SPU 算力极弱、VPU 只擅长规整向量。面对 if-else 采样效率极低
+
+更致命的场景是**投机解码原始版**——硬件要在极短时间动态判断哪些 token 猜对、随时丢弃部分计算图。这种"走一步看一步"的动态计算图是 TPU VLIW 静态指令集的克星。所以 Gemini 用 Tree Attention 张量化（第 14.2 节）把这类计算硬掰成矩阵乘。
+
+#### 19.3 动态网络路由：MoE All-to-All 的拥塞
+
+MoE 的核心是**动态路由**——每个 token 在运行时被路由到不同 expert：
+
+| 集群类型 | All-to-All 表现 |
+|---|---|
+| GPU（NVSwitch + IB fat-tree） | 任意 N:N 通信都能提供无阻塞全交叉带宽，对 MoE 这种乱序、动态的数据包分发友好 |
+| TPU（3D Torus 环网） | 静态 All-Reduce 天下无敌；但 All-to-All 时 token 要跨 X/Y/Z 多个中继芯片找 expert，**部分链路被挤爆，其他闲置**，端到端延迟拖慢 |
+
+#### 19.4 Decode 大 Batch 救不了 MoE：两个死局
+
+直觉：增大 batch size 让 MoE 通信密度上升、计算可以掩盖通信。但有两个物理死局：
+
+**死局一：Token 被打散，矩阵依然小**
+
+并发 512 个请求 → MoE 层 → 路由给 8 个 expert → 平均每个 expert 只分到 64 个 token。`[64, D] × [D, 4D]` 对 MXU 来说是「塞牙缝」，远没到能掩盖通信延迟的体量。
+
+**死局二：KV Cache 撑爆 HBM**
+
+不可能无限增大 batch。如果开到能让 MoE 算力饱和的程度（几千），HBM 早就 OOM 了。
+
+**结论**：Decode 阶段 MoE 通信开销只能缓解，不能完全掩盖。
+
+#### 19.5 Multi-hop 影响延迟还是带宽
+
+在 3D Torus 上跨多机架找 expert：
+
+- **小 batch 时**：主要影响**延迟**。光信号中继 + 收发的物理延迟逃不掉
+- **大 batch 时**：致命的是**双向对分带宽（Bisection Bandwidth）**。token 散乱地往各方向挤，部分光纤瞬间过载，实际可用带宽暴跌
+
+#### 19.6 计算掩盖通信的数学条件
+
+为什么 Prefill 能掩盖通信、Decode 不能？看维度：
+
+| 阶段 | 计算量 | 数据传输量 | 比值 |
+|---|---|---|---|
+| **Prefill**（GEMM） | $O(N^3)$ | $O(N^2)$ | 计算时间 ≫ 网络时间，DMA 后台搬数 MXU 完全无感 |
+| **Decode**（GEMV） | $O(N^2)$ | $O(N^2)$ | 比值约为 1，MXU 瞬间算完后只能停机干等 |
+
+#### 19.7 HBM 带宽 vs 算力失衡（呼应 6.4）
+
+第 6 章的物理定律：算力 $O(N^2)$ 涨，传统带宽 $O(N)$ 涨。v4 时代严重失衡，Decode MFU 跌到个位数。
+
+Google 的硬件级补救：**v5e 故意缩小 MXU**，降低峰值 FLOPs，让 compute / bandwidth 比例回到健康区间。
+
+算法级补救：**MQA / GQA**（多查询 / 分组查询注意力）——大幅缩小 KV Cache 体积，减少每次 Decode 从 HBM 捞数据的压力。这纯粹是为了迁就可怜的内存带宽对模型架构做的让步。
+
+#### 19.8 每条劣势换来了什么
+
+| 劣势 | 换来 |
+|---|---|
+| MXU 粒度大 | 同硅面积塞下更多算力单元，能效高 |
+| SPU 弱 | 省下的晶体管堆给 MXU |
+| 3D Torus 不擅长 All-to-All | 极致的规整集合通信效率，无外部交换机开销 |
+| HBM 带宽跟不上 | 算力密度爆表，跑 Prefill / 训练时 MFU 高 |
+
+每条短板都对应一个 trade-off。理解了这些权衡才能判断什么 workload 该上 TPU、什么该留 GPU。
+
+---
+
+## 附录
+
+### A. Trade-off 速查表
+
+按设计决策维度横切，每条 trade-off 链接回原章节。
+
+| 维度 | TPU 选择 | 代价 | 收益 | 章节 |
+|---|---|---|---|---|
+| **静态 vs 动态调度** | 静态 VLIW + XLA | 编译开销大、shape 变化要重编 | 硬件极简、能效高 | Ch 1, 7, 8 |
+| **缓存 vs 直传** | 取消硬件 Cache，用 UB + DMA | 软件管理复杂 | 节省硅面积给 MXU | Ch 1, 6 |
+| **粒度大 vs 小** | MXU 128×128 | 小矩阵浪费 | 大矩阵密度高 | Ch 1, 19 |
+| **环 vs 树** | 3D Torus | All-to-All 拥塞、长边大圈延迟 | All-Reduce 极致、无外部交换机 | Ch 2, 4, 19 |
+| **物理 vs 光路** | OCS 重配 | 切分粒度受机架限制 | 拓扑动态可重配、故障自愈 | Ch 3, 15 |
+| **集中 vs 分布编排** | Multi-host SPMD | 故障半径 = slice | 编排简洁、SPMD 透明 | Ch 5, 16 |
+| **算力 vs 带宽** | 算力堆面积，带宽吃封装 | 内存墙、Decode MFU 低 | Prefill / 训练 MFU 高 | Ch 6, 19 |
+| **专用 vs 通用** | Pallas 写 PagedAttention | 工程门槛高，每个动态算子都要手写 | 突破 XLA 静态限制 | Ch 11, 14 |
+| **Padding vs 重编译** | 保 batch 桶，不够用 dummy | 浪费小部分算力 | 避开重编译灾难 | Ch 8, 12 |
+| **算法迁就硬件** | Capacity Factor、Tree Attention | 模型架构有 token dropping、增加 mask 复杂度 | TPU 上能跑通 MoE 和投机解码 | Ch 14 |
+
+### B. 数字 / 参数清单
+
+所有数字都标"源自原对话"。
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| TPU v4 Pod 规模 | **4096 颗芯片** | 64 机架 × 64 芯 |
+| TPU v5p Pod 规模 | **8960 颗芯片** | 满规模 |
+| 单机架芯片数 | **64 颗**（v4 水冷） | 4 颗/板 × 16 板 |
+| MXU 尺寸 | **128 × 128** MAC 单元 | v4 / v5p |
+| 4×4×4 机架对外光纤数 | **96 根** | 8 角×3 + 24 棱×2 + 24 面心×1 |
+| 表面 TPU 数 | **56 颗** | 64 - 内部 8 颗 |
+| 等效 H100 算力硬件成本 | **~$21,000** | NVIDIA 售价 |
+| 等效 TPU v5p 硬件成本 | **~$6,900** | Google 内部 |
+| 8×H100 VM 按需价 | **$100-120 / 小时** | Azure / GCP |
+| 8×TPU v5e 节点按需价 | **$10-11 / 小时** | Google Cloud |
+| H100 TDP | **700W** | |
+| H100 训练 MFU | **50% - 52%** | 大型 LLM 集群 |
+| TPU v5p 训练 MFU | **58% - 60%** 或更高 | 同等任务 |
+| TPU 能效优势 | 比 GPU 集群低 **60-65% 能耗** | 特定大规模矩阵 workload |
+| Tokens / $ 优势（预训练） | TPU 高 **15% - 25%** | H100 → v5p |
+| Midjourney 推理账单 | **$2.1M → <$0.7M / 月** | 迁 TPU v6e，3× |
+| Character.AI 成本改善 | **3.8×** | 转 TPU |
+| Waymark 视频生成 | **4×** | 比 H100 低 |
+| CPU:TPU 比例 | **1:4 或 1:8** | 物理焊死 |
+| ICI 单链路带宽量级 | （原对话未给数字） | 公开资料 v4 ≈ 4.5 TB/s 多向合计，待你确认 |
+| H100 L2 Cache | **50 MB** | 上下文中提到 |
+| MoE Capacity Factor 例 | 每 expert 64 个 token | 原对话举例 |
+| v5p 长边可能尺寸 | **35** | 16×16×35 ≈ 8960 估算 |
+| 跨机架 Z 轴 8 跳大圈 | **6 跳铜缆 + 2 跳光路** | 4×4×8 切片 |
+| 光路 vs 铜缆延迟 | 光路 **几百 ns**，铜缆 **个位到十位 ns** | NUCA 异构 |
+
+### C. 术语 ↔ GPU 等价物对照
+
+| TPU 术语 | GPU 等价物 | 备注 |
+|---|---|---|
+| **MXU** | Tensor Core | TPU 单个大阵列 vs GPU 多个小阵列 |
+| **VPU** | CUDA Core（部分） | TPU 偏向规整向量 |
+| **SPU** | 标量调度 + 寄存器 | TPU 控制流弱 |
+| **Unified Buffer (UB)** | Shared Memory + L1/L2 | TPU 软件管理；GPU 硬件管理 |
+| **HBM** | HBM | 一样 |
+| **ICI** | NVLink + IB（合并对应） | TPU 节点内外同一套，GPU 分两层 |
+| **OCS** | （无对应） | 唯一 |
+| **3D Torus** | Fat-Tree（不同思想） | 拓扑哲学不同 |
+| **SPMD** | NCCL collective + MPI rank | TPU 编译器统管 |
+| **VLIW 五槽** | （无完全对应） | GPU 是 SIMT |
+| **XLA** | TorchInductor / TVM / TensorRT | TPU 的核心；GPU 是可选 |
+| **HLO / StableHLO** | FX Graph / TorchScript | XLA 的 IR |
+| **Pallas** | Triton | 自定义 kernel 语言 |
+| **JetStream** | TensorRT-LLM | 厂商特化推理引擎 |
+| **Saxml** | DeepSpeed Inference（部分） | JAX 生态历史 |
+| **TPU Provisioner** | （无对应） | 最接近的是 Slurm topology + 手工 NCCL |
+| **TPU Device Plugin** | NVIDIA Device Plugin | K8s 概念一样 |
+| **LWS / JobSet** | MPI Operator / Training Operator | Multi-host 编排 |
+| **DCN（数据中心网络）** | 控制面 IB / Ethernet | TPU 用以太网，GPU 也常用 IB |
+| **Capacity Factor**（MoE） | （无 TPU 特有的对应；GPU 上 Capacity Factor 概念存在但不强制） | 静态化 trick |
+| **Tree Attention**（投机解码） | 同名 | 算法层；现在 GPU 也用 |
+| **Bucketing + AOT** | torch.compile + persistent cache | TPU 必须；GPU 可选 |
+| **NUCA 拓扑感知映射** | NCCL 拓扑发现 | TPU 由 XLA 自动；GPU 半手工 |
+
+---
+
+## 写作日志（让作者验收用）
+
+### 主动取舍清单（原对话里有但没进笔记）
+
+下面这些细节我看到了但没收进正文，请你决定要不要加回。
+
+1. **vLLM `model.generate()` 的 token 生成调用栈**（原对话第 850-870 行附近）：详细描述了 `Lazy Tensor` 机制下 PyTorch eager 一行一行调 ATen 的过程。我觉得是对 Eager 模式的 GPU 端解释，不是 TPU 笔记重点，简化成了 Ch 8.1 表格里的"PyTorch Lazy Tensor"一行
+2. **GPU 单卡 SASS 指令的具体例子**（原对话第 700-720 行）：`LDG.E`、`STS [Shared_Addr_A]`、`HMMA.1688.F16` 这些指令名我只在 Ch 17.1 用了一次。如果你想保留更详细的 GPU 指令对照可以扩
+3. **SPMD 启动方式的 Pod ID 读取细节**（原对话第 604 行）：「代码内部读取硬件 Device_ID 决定加载哪块数据」。我在 Ch 16.2 简化成"读环境变量确定身份"，没区分 TPU device ID 和 K8s pod 环境变量两个层级。要不要展开？
+4. **TPU v6e（Trillium）**：原对话 1707 行提到这是「第六代」纯推理芯片，但没具体规格。Midjourney 案例里出现过它的名字。我没单开一节。如果你想要 v6e 专门的设计取舍可以扩
+5. **OCS 内部的 MEMS 阵列双层结构**（原对话 1521-1538 行）：第一面镜子瞄准方向，第二面镜子做光束矫正、防止光纤入口角度偏差衰减。我在 Ch 3.1 合并成了「输入 → 反射 → 反射 → 输出」一段，没强调"双层 MEMS 必要性"。要不要细化？
+6. **OCS 对外的物理布线（MPO/MTP 高密度光缆）**：原对话 2278 行讲了机房里 96 根光纤是用 MPO/MTP 一束 16/32 芯的高密度光缆汇聚。我提了一句但没展开物理形态。
+7. **Capacity Factor 的代价细节**：原对话 1628-1631 行提到 token dropping 或者「强制走兜底通用网络」。我只写了 dropping，没写兜底网络这条。
+8. **采样的具体细节**（Top-K / Top-P / 温度 / 惩罚因子）：Ch 19.2 提了这是 SPU 弱点，但没展开各采样算法的硬件代价
+9. **Cerebras / Groq 的设计**（原对话 1500-1510 行）：作为「别的厂在干什么」的旁支，提到了 Wafer-Scale 和 LPU。我没收进正文，因为不是 TPU 主题。要不要加个附录 D「行业横向对照」？
+10. **"硬件级稀疏支持 / 时钟门控断电"（原对话 1810 行）**：作为下一代芯片的演进方向。我在 Ch 14.4 一笔带过了，没专门小节
+
+### 外部补充清单（Claude 加，原文未提及）
+
+以下是我在正文里用 `> **[补充 — Claude 加]**` 显式标注的内容：
+
+- Ch 2.1：ICI 单链路 4.5 TB/s 量级（公开资料，原文未给数字）
+- Ch 3.6：微软 Azure 部分集群试用 Lumen OCS（行业旁注，未进正文）
+- Ch 6.4：v4 时代 MFU 跌到个位数无别的来源验证
+- Ch 13.5：Mooncake 类 KV pool 的提及（未进正文）
+- Ch 18 末尾：Midjourney / Character.AI / Waymark 的具体数字源对话只说"公开报告显示"，没给年份和出处，请核实
+
+如有遗漏的取舍点你审 PR 时随时提出来，我在 PR 里直接补。
+
