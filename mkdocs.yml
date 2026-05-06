@@ -64,6 +64,7 @@ nav:
     - "体系化专题":
       - "LLM 从原理到生产级推理": https://random-liu.github.io/llm-inference-principle-to-production/
     - "技术笔记":
+      - "TPU 深入笔记：从单芯片到生产集群": notes/tpu-deep-dive.cn.md
       - "示例笔记": notes/example_note.cn.md
       - "敬请期待": notes/coming_soon.cn.md
   - "English":
@@ -71,6 +72,7 @@ nav:
     - "Structured Projects":
       - "LLM Inference": https://random-liu.github.io/llm-inference-principle-to-production/
     - "Tech Notes":
+      - "TPU Deep Dive: From Single Chip to Production Cluster": notes/tpu-deep-dive.md
       - "Example Note": notes/example_note.md
       - "Coming Soon": notes/coming_soon.md
 
