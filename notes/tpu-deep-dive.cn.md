@@ -431,3 +431,509 @@ NVIDIA H100/B100 也用 CoWoS（同样台积电方案），技术路线一样。
 **Trade-off**：H100 用大 cache 容忍随机访问；TPU 用大 MXU 跑稠密。两条路对应不同的工作负载假设。
 
 ---
+
+## Part II — 编译与运行时：XLA
+
+### 7. XLA 编译模型：把不确定性消灭在编译期
+
+**一句话**：XLA 的核心打法是「把所有不确定性在编译期消掉」——算子融合、静态 padding、软件流水线、VLIW 指令包都是这个思路的不同切面。
+
+#### 7.1 算子融合
+
+最经典的例子：一层 `MatMul + Bias + ReLU`。
+
+朴素执行（GPU eager 模式）会：
+1. 算 MatMul → 写回 HBM
+2. 读出来加 Bias → 写回 HBM
+3. 读出来做 ReLU → 写回 HBM
+
+XLA 把三步融合成一个计算块：
+
+```
+HBM → UB（MatMul 输入） → MXU 算 MatMul → 流出瞬间送进 VPU → VPU 做 Bias + ReLU → HBM
+```
+
+**节省了 2/3 的 HBM 读写**。这种融合在 LLM 里普遍存在，比如 Attention 后面紧跟的 dropout/scale/mask 通常都被融进同一个块。
+
+#### 7.2 静态 Padding
+
+MXU 是 128×128 的硬连线阵列。如果你的矩阵是 100×100，XLA 不会让硬件去处理边界——硬件根本不支持。XLA 直接在编译期把矩阵 padding 到 128×128（多余位置填 0）。
+
+代价：白算 28 行 × 28 列 ≈ 50% 的边界算力。
+收益：阵列保持满速流动，不用停下来做边界判断。
+
+在脉动阵列里，**让硬件全速跑空格远比中途停下来快**。
+
+#### 7.3 软件流水线
+
+XLA 在编译期就算好每次 DMA 搬数需要多少 cycle，静态生成指令：MXU 算第 N 块时，DMA 已经在搬第 N+1 块的权重。计算和访存完美重叠。
+
+#### 7.4 VLIW 五槽：单芯片 + 跨芯片同构
+
+单芯片版指令包：
+
+```
+[ DMA ] | [ MXU ] | [ VPU ] | [ SPU 控制流 ]
+```
+
+多芯片协作版多了一槽——**ICI 网络槽**：
+
+```
+[ DMA ] | [ MXU ] | [ VPU ] | [ ICI 网络引擎 ] | [ SPU 控制流 ]
+```
+
+关键洞察：**对 TPU 来说，跨芯片传数据（ICI）和片内搬砖（DMA）是平级的**——都是 VLIW 指令字上的一个开关。XLA 可以做到 MXU 算乘法的同时，ICI 把上一层的梯度传给隔壁芯片，**计算和跨节点通信在时钟周期级别完美重叠**。
+
+这是 GPU 体系做不到的。GPU 的跨节点通信要触发 CPU 中断、构建数据包、过 IB 交换机，是另一套子系统。
+
+#### 7.5 一个具体的伪汇编例子
+
+计算 $C = A \times B$，$A$ 是 256×128，$B$ 是 128×256。MXU 是 128×128。
+
+XLA 在编译期把 $A$ 切上下两块 ($A_0, A_1$)，$B$ 切左右两块 ($B_0, B_1$)，分解成 4 个 128×128 子任务。所有 HBM 地址在编译期硬编码（无运行时指针计算）。
+
+执行 $C_{00} = A_0 \times B_0$ 的 VLIW 流：
+
+```
+Instruction 1（预热加载权重）:
+  [DMA] LOAD_HBM_TO_UB (Src: HBM_B0, Dst: UB_B)
+  [MXU] NOP
+  [VPU] NOP
+  [SPU] WAIT_DMA_DONE
+
+Instruction 2（权重驻留）:
+  [DMA] NOP
+  [MXU] LOAD_UB_TO_WEIGHT_REG (Src: UB_B)
+  [VPU] NOP
+  [SPU] WAIT_MXU_DONE
+
+Instruction 3（核心计算 + 流水线预取）:
+  [DMA] LOAD_HBM_TO_UB (Src: HBM_A0, Dst: UB_A)
+  [DMA_ASYNC] LOAD_HBM_TO_UB (Src: HBM_B1, Dst: UB_B_Next)  ← 提前预取下一块
+  [MXU] MATMUL_STREAM_ACT (Src: UB_A, Dest: Accumulator_C00)
+  [VPU] NOP
+  [SPU] WAIT_MXU_DONE
+
+Instruction 4（融合 ReLU）:
+  [DMA] NOP
+  [MXU] NOP
+  [VPU] READ_ACCUM_AND_RELU_AND_STORE (Src: Accumulator_C00, Dst: UB_C00)
+  [SPU] WAIT_VPU_DONE
+
+Instruction 5（写回 HBM）:
+  [DMA] STORE_UB_TO_HBM (Src: UB_C00, Dst: HBM_C00)
+  [MXU] NOP
+  [VPU] NOP
+  [SPU] JUMP_TO_NEXT_BLOCK  ← 准备算 C01
+```
+
+注意 Instruction 3：**DMA 在搬下一块的同时 MXU 在算**。如果 XLA 算错任何一个 cycle，要么 UB 溢出，要么 MXU 空转。这种精度只有静态编译才能给。
+
+#### 7.6 ↔ GPU
+
+| 维度 | TPU XLA | GPU |
+|---|---|---|
+| 调度 | 编译期静态 | 运行期动态（Warp Scheduler） |
+| 隐藏访存延迟 | 静态流水线 | 海量并发线程切换 |
+| 指令格式 | VLIW 多槽并发 | SIMT 单指令多线程 |
+| 算子融合 | XLA 自动 | TorchInductor / TVM / Triton 半自动 |
+
+**Trade-off**：XLA 的"全局上帝视角"在调度规整工作负载时无敌，但只要算子图里出现动态形状，就要重新编译。
+
+---
+
+### 8. 编译时机：JIT、AOT、bucketing、persistent cache
+
+**一句话**：静态编译的代价是首跑慢，工业上靠 bucketing + AOT + cache 把这个代价摊薄。
+
+#### 8.1 JIT 在 PyTorch/XLA 上的真实时间线
+
+vLLM 等推理框架在 TPU 上启动后的真实流程：
+
+| 阶段 | 动作 | XLA 状态 |
+|---|---|---|
+| 1. 初始化 | 加载权重到 HBM | **未编译**。只有 nn.Module 对象和权重张量 |
+| 2. Tracing | 第一次请求触发 `model.forward()`，PyTorch/XLA 用 **Lazy Tensor** 不真正计算，只记录 DAG | 在画图，生成 HLO IR |
+| 3. 触发编译 | 代码读 logits 做采样时遇到同步屏障（如 `xm.mark_step()`） | **立刻编译**：算子融合 + 静态地址 + 指令排布 → TPU Executable。耗时几秒到几十秒 |
+| 4. 执行 + 缓存 | TPU 跑出结果（毫秒级），编译产物存内存中的 Compiler Cache | Cache key 包含计算图结构和所有输入 shape |
+| 5. 后续请求 | 同 shape 命中 cache，跳过编译 | 直接复用 |
+
+**关键澄清**：权重数值不进编译产物。XLA 只关心权重的 shape 和 dtype，把权重视为"静态显存地址指针"。换微调过的 LoRA 权重、换同架构的另一个模型都不需要重编。
+
+#### 8.2 工业级解法：bucketing + AOT + 持久化 cache
+
+生产环境绝不能让第一个用户等 30 秒编译。流程如下：
+
+**Step 1：限制并离散化 bucket**
+
+算法团队 profiling 后定一组离散桶：
+
+```
+BS_Buckets    = [1, 2, 4, 8, 16, 32, 64]
+SeqLen_Buckets = [128, 512, 1024, 2048, 4096, 8192]
+```
+
+运行时来一个 BS=5 的请求，padding 到 BS=8 进对应桶。
+
+**Step 2：CI/CD 阶段 AOT 预热**
+
+构建 Docker 镜像或发布制品时加一个 warmup 环节：拉起含真实 TPU 拓扑的 CI 节点，遍历 `BS × SeqLen` 所有组合发假请求触发编译。
+
+**Step 3：持久化 cache 打进镜像**
+
+用 `XLA_FLAGS="--xla_dump_to=/path/to/cache"` 把编译产物落盘。流水线最后把这几百 MB 到几 GB 的 cache 文件**直接打进 release 镜像**或挂在分布式存储里。
+
+线上 vLLM/JetStream 实例启动时读这个 cache，命中桶就**毫秒级下发硬件**。
+
+#### 8.3 为什么没有"天下大同"的预编译库
+
+一个 XLA Executable 绑定的不只是模型 shape，还包括以下**致命变量**——任意一个变了缓存就失效：
+
+| 变量 | 影响 |
+|---|---|
+| **物理硬件拓扑** | v5e-8（一维环）的编译产物给不了 v5p-32（3D Torus），XLA 把走哪根光纤、延迟多少都算死了 |
+| **并行切分策略** | TP 切 Attention 还是 FFN？PP 怎么切？这些 SPMD 注解必须编译前确定 |
+| **编译器版本** | XLA / LLVM 后端更新频繁，旧 cache 大概率校验失败 |
+| **模型结构微调** | 加一层 adapter、改 RoPE base 频率→常量折叠结果变→HLO hash 变→cache 全废 |
+
+所以每个团队都得自己维护一套**模型分发 + 缓存预热**流水线。基础设施大版本发版背后必然伴随大规模自动化重新编译。
+
+#### 8.4 ↔ GPU
+
+GPU 也有这套问题（PyTorch 2.x 的 `torch.compile` / Inductor / TensorRT），但程度轻得多：因为 GPU 硬件能在运行时容忍 shape 变化（动态调度），编译失败时还能 fallback 到 eager。TPU 没有这个 fallback，编译失败 = 服务失败。
+
+---
+
+### 9. XLA 拓扑感知映射
+
+**一句话**：编译器知道 3D Torus + OCS 的物理拓扑，所以能把高密度通信映射到短边、低频同步映射到长环。
+
+第 4.6 节讲过 NUCA：跨机架的 8 跳大圈里，6 跳铜缆 + 2 跳光路，带宽同构延迟异构。XLA 在编译时把不同性质的并行策略塞进不同性质的拓扑。
+
+#### 9.1 TP 走小圈，DP 走大圈
+
+| 并行策略 | 通信特征 | 映射到 |
+|---|---|---|
+| **张量并行 (TP)** | 步步为营，每个线性层都要同步激活值。**对延迟极敏感** | X 轴或 Y 轴的 4 / 8 短铜环 |
+| **数据并行 (DP)** | 秋后算账，每个 step（甚至累积几个 step）才同步一次梯度。梯度矩阵大，对带宽要求高，对单次延迟容忍 | Z 轴的 35 节点大光环 |
+| **流水线并行 (PP)** | 阶段间传 activation，频次中等 | 通常分给中等长度的边 |
+| **专家并行 (EP)** | 动态 All-to-All（MoE） | Torus 上吃亏，详见第 19 章 |
+
+DP 走大圈时，35 跳的物理延迟被流水线稳态掩盖，并且底层计算单元可以利用同步等待时间做下一个 step 的前向计算（Compute-Communication Overlap）。
+
+#### 9.2 拓扑信息怎么传给 XLA
+
+K8s 给 Node 打的标签（如 `cloud.google.com/gke-tpu-topology: 4x4x4`）携带了切片的几何形状。XLA Runtime 启动时读这些 + PCIe sysfs 信息，构造拓扑图。然后根据用户的 SPMD 切分注解把通信组映射到具体的 ICI 链路。
+
+**结论**：纯 K8s 调度只看节点存活，真正的高性能 AI 调度看的是微秒级的光电物理边界。
+
+#### 9.3 ↔ GPU
+
+GPU 体系里类似的事情靠手工 NCCL group 配置 + `torch.distributed` 的拓扑感知 API。NCCL 知道 NVLink/IB 的层级，但 fat-tree 本身近似对称，拓扑感知的优化空间没 Torus 那么大。
+
+---
+
+## Part III — 推理层适配（目标 C）
+
+### 10. 软件栈分叉：vLLM、JetStream、Saxml、GKE
+
+**一句话**：TPU 上推理框架不止一个，三家定位不同；GKE 是把它们都装进集群的胶水。
+
+#### 10.1 GKE 为什么死磕 vLLM on TPU
+
+vLLM 是开源推理事实上的"Linux"——绝大多数客户在 GPU 上用 PyTorch + vLLM 写好了业务代码（API 封装、调度、自定义 prompting）。GKE 想卖 TPU（v5e/v5p 极具性价比），最大阻力是迁移成本：
+
+> 如果客户得改代码才能上 TPU，他们就跑了。
+
+所以 Google 的策略是 **Lift and Shift**：让客户原本的 `vllm serve` 命令换个基础镜像就在 TPU 上跑起来，PyTorch 调用被自动路由到 PyTorch/XLA。
+
+技术底座：vLLM 官方代码库已包含 TPU backend，PagedAttention 在 TPU 静态图上的水土不服由 Google 工程师用 Pallas 写的自定义 kernel 补齐。
+
+#### 10.2 三家的位置
+
+| 框架 | 定位 | 目标客群 |
+|---|---|---|
+| **vLLM** | 生态兼容王，"代码不想改" | 创业公司、多云客户、GPU 迁移 |
+| **JetStream** | TPU 性能榨汁机 | 大厂、高并发推理，愿意为性能改框架 |
+| **Saxml** | JAX 生态历史重型武器 | 深度绑 JAX 的存量大客户、特殊大规模切分 |
+
+#### 10.3 JetStream 凭什么比 vLLM 快 20%-50%
+
+JetStream 是 Google Cloud + XLA 团队联合主导，专为 v5 系列定制。它**不去硬凑动态分页**，而是完美契合 TPU 的静态编排哲学：
+
+- 极深度的连续 Batching 优化
+- 大量 XLA 算子融合
+- 直接跟编译器协同设计，没有 PyTorch 这层间接
+
+代价：API 不像 vLLM 那么开箱即用，对 PyTorch 生态的支持需要专门做。
+
+#### 10.4 Saxml 为什么靠后
+
+最早伴随 Pax / Seqio 一起诞生，深度绑 JAX。带浓厚的 Google 内部基础设施味道，外部上手门槛高，PyTorch 支持滞后。在公有云推广优先级靠后。
+
+#### 10.5 ↔ GPU
+
+| TPU | GPU |
+|---|---|
+| vLLM-TPU（带 Pallas） | vLLM 原生 |
+| JetStream | TensorRT-LLM（NVIDIA 自家 + 特化） |
+| Saxml | (无完全对应；DeepSpeed Inference 算半个) |
+| Pallas 写 kernel | Triton / CUDA C++ |
+
+---
+
+### 11. PagedAttention 与连续批处理在 TPU 上的适配
+
+**一句话**：GPU 上的动态内存管理（PagedAttention、Continuous Batching、Radix Tree）天生不适合静态编译；TPU 上靠 Pallas 写自定义 kernel + 把动态切到张量层来适配。
+
+#### 11.1 没有 Pallas 之前：静态连续分配的低效
+
+早期 TPU 推理（T5、早期 Pax）走的是"强迫症"路线：
+
+- XLA 在编译期按 `[Max_BS, Max_SeqLen, Hidden_Dim]` 一次性挖出连续 KV Cache 池
+- 假设 max_seq=4096，每个请求锁死 4096 个 Token 的 HBM 空间
+- 用户请求只有 100 个 Token？剩下 3996 个 slot 全部空跑（浪费 97% 显存）
+- HBM 被无效 padding 占满 → batch size 上不去 → MXU 计算裕量充足但请求接不进 → **被内存墙卡死了算力**
+
+Google 早期靠"钞能力"扛——Pod 总 HBM 大、任务长度可控（翻译/搜索）、算法团队把桶切得极细——硬挺过去了。但长文本和多轮对话普及后这条路走不通。
+
+#### 11.2 现代分治：XLA 建池子，vLLM 记账，Pallas 按图索骥
+
+vLLM on TPU 现代架构是**控制面（CPU）+ 数据面（TPU）分离**：
+
+| 角色 | 在哪 | 干什么 |
+|---|---|---|
+| **XLA** | TPU | 在 HBM 里分配一个一维化的巨大块张量 `[Num_Total_Blocks, Block_Size, Head_Dim]`（比如 10 万个物理块，每块 16 个 Token）。**XLA 不知道里面装的是谁的数据** |
+| **vLLM** | CPU | 维护 Radix Tree 和所有内存页表（Block Tables）。每个 step 把当前活跃请求的页表打包成整数 Tensor 喂给 XLA 图 |
+| **Pallas Kernel** | TPU | XLA 图里的一个 Custom Call 节点，接收页表后执行底层间接寻址（Gather），把零散物理块拼进 Unified Buffer 做 Attention |
+
+**物理 HBM 还是 XLA 圈的全局张量，但 XLA 不再管理里面的内容。** vLLM 当调度员每个 cycle 把"寻址地图"发过去，TPU 上的 Pallas 算子照着地图取数据。
+
+#### 11.3 三把刀的逐项落地
+
+**PagedAttention（分页注意力）**
+
+- TPU 阵痛：XLA 极度讨厌动态指针寻址，每次 Attention 都查页表会让 DMA 剧本乱套
+- 解法：Pallas Kernel 在硬件寄存器层面手写页表查找 + 离散 Gather
+- 结论：完全支持，HBM 碎片问题解决，batch size 提升
+
+**Continuous Batching（连续批处理 / Inflight Batching）**
+
+- GPU 玩法：1D 展平，调度器随时踢掉完成的、塞进新的，绝对动态
+- TPU 玩法（**静态大巴模式**）：
+  - XLA 预编译 `Batch_Size = 256` 的固定图，相当于 256 座大巴永远绕圈
+  - 某请求生成到 EOS → vLLM 把座位标空 → 下个 step 把新请求的第一个 Decode Token 塞进刚空出来的索引
+  - TPU 只看到完美 `[256, 1, D]` 张量，不知道索引 5 上一毫秒是 A、这一毫秒是 B
+  - 不够 256 真实请求时用 Dummy Token（全零）填满
+
+**Radix Tree（前缀缓存）**
+
+- 在 TPU 上**完美适用**：本质是 CPU 端的调度算法
+- 命中前缀时 vLLM 只需修改下发的 Block Table 让逻辑块指针指向已有物理块
+- TPU 底层 Pallas 不知道是复用，按地图正常取数即可
+
+#### 11.4 Google 自家也用同样的思想
+
+JetStream / Saxml 也实现了等价机制（内部叫 **Blocked Attention** 或内置在底层的 **FlashAttention-TPU** 算子里），同样用 Pallas 写。所以 GKE 上跑 vLLM 还是 JetStream，**显存管理思想殊途同归**：HBM 维护离散 Block Pool + CPU 维护页表 + 计算时把页表传给底层 Kernel 做 Gather。
+
+#### 11.5 一个核心哲学：FLOPs 换 Control Flow
+
+**用极其廉价的 FLOPs（算力），去消除极其昂贵的 Control Flow（控制流）。**
+
+这条贯穿 TPU 整个推理适配。Tree Attention（第 14 章）也是同一思想——把 if-else 编码成 Mask 矩阵，宁可多算多扔，也不让硬件停下来做分支判断。
+
+#### 11.6 ↔ GPU
+
+| 维度 | TPU | GPU |
+|---|---|---|
+| KV 分页 | XLA 池子 + Pallas Custom Call | vLLM 原生 PagedAttention |
+| 调度灵活度 | 固定 batch 桶 + Dummy padding | 动态 1D 展平 |
+| Custom kernel 工具 | Pallas | Triton / CUDA |
+
+---
+
+### 12. Prefill / Decode 协同与 Chunked Prefill
+
+**一句话**：TPU 在 Prefill 强、Decode 弱（HBM 带宽瓶颈），混合执行 + chunked prefill 是用算法补硬件。
+
+#### 12.1 算术强度决定 TPU 体感
+
+判断硬件适合不适合一个 workload，看 **算术强度 = FLOPs / Byte**（每读写一个字节内存能做多少次浮点运算）。
+
+| 阶段 | 数学形式 | 算术强度 | 瓶颈 | TPU 体感 |
+|---|---|---|---|---|
+| **Prefill** | GEMM（矩阵 × 矩阵，权重被几千 token 复用） | 极高 | Compute-Bound | MXU 跑得极爽 |
+| **Decode** | GEMV（矩阵 × 向量，权重读出来只算 1 个 token 就丢） | 极低 | Memory-Bound | MXU 大量饥饿停机 |
+
+所以 TPU 骨子里是 **Prefill 怪物**，Decode 阶段是被按在地上摩擦后强行优化出来的。
+
+#### 12.2 Decode 阶段 TPU 怎么搞 Continuous Batching
+
+**Decode 阶段不需要给 token 设桶**——每个请求当前要算的新 token 长度恒为 1。设的是 **Batch Size 的桶**。
+
+预编译 BS=256 的 Decode 图：
+
+- 静态输入矩阵 `[256, 1, Hidden_Dim]`
+- 200 个真实请求 → 前 200 槽位放真 token，后 56 槽位塞 Dummy Token（全零）
+- TPU MXU 算出 256 个结果
+- CPU 调度器只把前 200 个真实结果拿走发用户，后 56 个丢弃
+
+**核心难点：256 个请求的历史长度都不一样怎么办？**
+
+CPU 还要传两个静态大小的整数数组：
+
+```
+context_lengths : 形状 [256]，记录每个请求真实历史长度，如 [105, 3042, 12, ...]
+                  Dummy 槽位的长度填 0
+block_tables    : 形状 [256, Max_Blocks]，每个请求的 KV 页表
+```
+
+Pallas 算子按 `context_lengths` 做循环边界（或 mask），按 `block_tables` 去 HBM gather 对应历史 KV，做 Attention。
+
+#### 12.3 Prefill 的难处：每个请求 Prompt 长度差异巨大
+
+Decode 可以拼成 `[256, 1]` 的整齐方块，但 Prefill 不行：有人 prompt 100，有人 3000，怎么塞进静态图？
+
+两种方案：
+
+- **分桶**：长度 100 → padding 到 128 桶；3000 → 切到 4096 桶
+- **Chunked Prefill**：编译固定长度的 Prefill 图（如 chunk_size=512）。长 1000 的 prompt 切两块 512，分两次塞进同一个 `[1, 512]` 槽位计算
+
+#### 12.4 Prefill / Decode 混合：静态 1D 展平
+
+最前沿的做法：把 Prefill 长序列和 Decode 单 token 揉进**同一个 step**。
+
+XLA 编译时设两个静态上限：
+
+```
+Max_Total_Tokens = 1024   # 一个 step 最多吞 1024 个 token
+Max_Seqs        = 256     # 最多 256 个并发序列
+```
+
+输入张量从 3D 的 `[Batch, Seq, D]` 展平成 2D 的 `[1024, D]`。
+
+CPU 端拼装：
+
+```
+请求 A (Prefill, 切下 chunk=512)  →  数组前 512 位
+请求 B~Z (Decode, 200 个 token)   →  紧接 200 位
+                                     共 712 位
+Dummy Token × 312                    →  补齐到 1024
+```
+
+**MXU 阶段**：对脉动阵列来说不存在身份差别。一个巨大 `[1024, D] × [D, 4D]` 矩阵乘法全速冲过去，1024 个 token 的 Q/K/V 一次性算出。
+
+**Attention 阶段**：到这里就糊弄不过去了——
+
+| Token 类型 | 该怎么 Attend |
+|---|---|
+| Prefill 的 512 个 | **互相**做 Attention，生成新 KV 写回页表 |
+| Decode 的 200 个 | 各自用自己的 1 个 Token 去 attend 自己的历史 KV Cache |
+| Dummy 的 312 个 | 跳过 |
+
+CPU 同时传 metadata：`seq_lens = [512, 1, 1, ..., 0, 0]`。Pallas 算子在底层解析 metadata，对 Prefill 块走 FlashAttention 逻辑（Q 向量在 UB 里互相点乘 + 写新 KV），对 Decode 块走 PagedAttention（gather 历史 KV），对 Dummy 块跳过。
+
+#### 12.5 GPU vs TPU 混合的差异
+
+| | GPU | TPU |
+|---|---|---|
+| 拼装方式 | 动态：712 → kernel 收 712；下次 850 → 收 850 | 静态：712 → 强行加 312 个 dummy → 1024 |
+| 硬件成本 | 调度器开销 | Padding 的 MXU cycle |
+| 软件成本 | kernel 灵活性高 | Pallas metadata 路由复杂 |
+
+**Trade-off**：Padding 浪费一小部分 MXU cycle 是可控的，但避免了重新编译 XLA 图的灾难，同时控制延迟抖动。两害相权取其轻。
+
+#### 12.6 ↔ GPU
+
+GPU 玩"网约车"：712 个乘客就发 712 座的车，绝不拉空座。
+TPU 玩"高铁直达专列"：班次到点就发，不够人就放假人。
+
+---
+
+### 13. KV / 内存层次
+
+**一句话**：GPU 体系里的 RDMA / GDS / KV offload 在 TPU 上有的天生支持、有的不支持、有的只能走 PCIe 后备。
+
+#### 13.1 三件事的对照
+
+| 优化技术 | GPU | TPU |
+|---|---|---|
+| **跨节点通信绕开 CPU**（GPU: RDMA over IB） | GPUDirect RDMA + IB 网卡 | **天生集成**：ICI 网络控制器直接做进 TPU 硅片，根本不需要外部网卡。CPU 完全不知情，零 CPU 周期 |
+| **直读存储到加速卡**（GPU: GPUDirect Storage） | NVMe → PCIe → GPU VRAM，绕过 CPU 内存 | **不支持**。TPU 没有直接读硬盘 / 外部网络的接口，必须 CPU 中转：GCS / PD → Host VM DDR → PCIe DMA → TPU HBM |
+| **KV Cache offload 到 host DRAM**（GPU: vLLM CPU swap） | HBM → PCIe → CPU DDR | **完全适用**。vLLM Block Manager 在 host CPU 上跑，HBM 满了触发 PCIe DMA 把 KV Block 搬到 host DDR |
+
+#### 13.2 ICI 比 RDMA 更彻底
+
+GPU 的 RDMA：数据 → PCIe → NIC → IB 网络 → NIC → PCIe → VRAM。绕过 CPU 内存，但还是要离开 GPU 芯片走外部网卡。
+
+TPU 的 ICI：数据 → 芯片边光模块 → 光纤 → 对端光模块 → 芯片。**根本不离开芯片硅片体系**。每秒几百 GB 的网络风暴里 host CPU 完全不知情。
+
+#### 13.3 直读存储缺失为什么能忍
+
+冷启动加载权重要把几百 GB 数据从 GCS 拉到 TPU HBM，必须 host CPU 当搬运工。但因为大模型部署是 multi-host 的（如 16 台 VM），16 台机器 CPU **并发**从 GCS 下载权重的不同 shard，总网络带宽极大，工程上可接受。
+
+#### 13.4 KV Offload 性能特征
+
+PCIe 带宽相对 ICI 来说**很窄**（v4 PCIe Gen4 x16 ≈ 64 GB/s 双向，而 ICI 单链路就能上几百 GB/s）。所以频繁 swap 会显著拖性能。这是防 OOM 的保底策略，不是首选。
+
+#### 13.5 ↔ GPU
+
+GPU 的优势在 GDS（直读存储），TPU 的优势在 ICI（更彻底的网络旁路）。两边各占一半。
+
+> **[补充 — Claude 加]** 业界开始有 **Mooncake 类的"分离式 KV pool"**（KV Cache 单独服务化、跨节点共享），目前主要在 GPU 体系。TPU 上对应的工作没看到公开方案。这条不写进正文，仅供你 cluster TL 视角参考。
+
+---
+
+### 14. Gemini 在 TPU 上的实战妥协
+
+**一句话**：MoE 和投机解码这两个推理优化，在 TPU 上都得改算法去迁就硬件。
+
+#### 14.1 静态化 MoE：Capacity Factor
+
+MoE 的天然问题是**动态路由**——你不知道下一个 token 会去找哪个 expert。XLA 不允许动态形状。
+
+Gemini 团队的解法：
+
+- 给每个 expert 设一个严格的 **Capacity Factor**（容量因子 / 静态槽位大小），比如规定每个 expert 一个 step 最多接 64 个 token
+- 路由过来的 token 不足 64 个 → 塞 Dummy Padding 凑齐
+- 路由过来的 token 超过 64 个 → 多出的**直接丢弃**（Token Dropping），或者强制走兜底通用网络
+
+通过这种粗暴的截断 + 填充，MoE 的动态网络被强制拍平成 XLA 喜欢的静态计算图。
+
+代价：偶尔丢 token，模型质量会受影响。Google 在 Gemini 训练时调 Capacity Factor 平衡丢弃率和算力开销。
+
+#### 14.2 张量化投机解码：Tree Attention
+
+传统投机解码：小模型猜 K 个 token → if-else 判断大模型是否同意 → 拒绝则回退。这种 if-else 流让 TPU VLIW 流水线崩溃。
+
+Gemini 的解法（**并行验证**）：
+
+- 小模型生成 K 个猜测 token 后，大模型把这 K 个拼成一个 1D 向量
+- 设计一个特殊的 **Tree Attention Mask**（树状注意力掩码），让不相关的节点互相看不到（Mask 乘 0）
+- 大模型在一次前向传播里**用一个矩阵乘法一口气把 K 个 token 的概率全部验证完**
+- 把猜对的那条路径挑出来，其他废弃
+
+这把"分支代码"变成了"小规模 Prefill 矩阵运算"。TPU 的 MXU 又狂喜了。
+
+#### 14.3 为什么这些妥协在 GPU 上不是必须
+
+- GPU 的 SIMT 调度器擅长 if-else（虽然分支发散会浪费 lane，但比 TPU 强得多）
+- GPU 的动态显存可以容忍 expert 容量浮动
+- 所以 GPU 上跑原始版 MoE 路由 + 原始版投机解码也能工作
+
+GPU 路线图里也在朝 Tree Attention 等张量化方向走，但不是被硬件逼的，是为了榨更多性能。
+
+#### 14.4 一个有趣的趋势
+
+正因为硬件极度讨厌分支（TPU 完全不能容忍，GPU 也不喜欢 host-device 高频同步），算法工程师在**绞尽脑汁把控制流（逻辑分支）改写成数据流（矩阵 mask）**。Tree Attention、Masked Attention、谓词执行 (Predication) 都是这个思路的不同形态。
+
+核心哲学：**全算再扔比 if-else 便宜**。计算规模有限的浅层分支（投机解码 3-5 步、Causal Mask 半个矩阵）这个套路超划算；但深层嵌套（10+ 层条件树）就 $O(2^N)$ 爆炸。所以新一代芯片设计在追 **硬件原生稀疏支持**——掩码全 0 时电路在物理层面跳过乘加运算（时钟门控断电），既不写 if-else 也不耗能。
+
+#### 14.5 ↔ GPU
+
+| 优化 | TPU 必须改 | GPU 可以不改 |
+|---|---|---|
+| MoE | Capacity Factor 静态化 | 动态路由可工作 |
+| 投机解码 | Tree Attention 张量化 | if-else 也能跑（性能差点） |
+
+---
